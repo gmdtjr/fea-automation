@@ -1,0 +1,80 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: feauser
+      POSTGRES_PASSWORD: feapass
+      POSTGRES_DB: fea_automation
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U feauser -d fea_automation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+      - ./watch_dir:/watch_dir
+      - ./output_dir:/output_dir
+      - ./tests/fixtures:/fixtures
+    ports:
+      - "8001:8000"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://feauser:feapass@db:5432/fea_automation
+      - REDIS_URL=redis://redis:6379
+      - WATCH_DIR=/watch_dir
+      - OUTPUT_DIR=/output_dir
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./backend
+    command: celery -A worker.celery_app worker --loglevel=info
+    volumes:
+      - ./backend:/app
+      - ./watch_dir:/watch_dir
+      - ./output_dir:/output_dir
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://feauser:feapass@db:5432/fea_automation
+      - REDIS_URL=redis://redis:6379
+      - WATCH_DIR=/watch_dir
+      - OUTPUT_DIR=/output_dir
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5174:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://backend:8000
+
+volumes:
+  pg_data:

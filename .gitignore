@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.next/
+
+# Env / secrets
+.env
+*.env.local
+
+# Output files (generated, not committed)
+output_dir/
+watch_dir/
+*.vtk
+*.stl
+*.odb
+*.dat
+*.inp
+*.msg
+*.023
+*.SMABulk
+*.simlog
+*.log
+
+# Abaqus work files
+abaqus.rpy
+abaqus_acis.log
+abaqus.rec
+
+# Docker volumes
+pg_data/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Test zip (large binary)
+tk-no3.zip

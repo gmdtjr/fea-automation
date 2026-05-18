@@ -1,0 +1,16 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+alembic>=1.13.0
+celery[redis]>=5.4.0
+redis>=5.0.0
+anthropic>=0.25.0
+watchdog>=4.0.0
+# gmsh has no ARM64 Linux wheel; install only on supported platforms
+gmsh>=4.12.0; platform_machine == "x86_64"
+numpy>=1.26.0
+python-multipart>=0.0.9
+matplotlib>=3.8.0

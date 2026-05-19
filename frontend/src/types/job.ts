@@ -15,12 +15,28 @@ export interface Job {
   status: JobStatus;
   geometry_params: GeometryParams | null;
   mesh_params: Record<string, unknown> | null;
+  bc_params: BcParams | null;
   mesh_result: MeshResult | null;
   analysis_result: AnalysisResult | null;
   ai_report: string | null;
   error_message: string | null;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export interface BcMaterial {
+  name: string;
+  youngs_modulus: number;
+  poissons_ratio: number;
+  density: number;
+  allowable_stress: number;
+}
+
+export interface BcParams {
+  material: BcMaterial;
+  pressure_mpa: number;
+  fixed_faces: "inlet" | "outlet" | "both";
+  allowable_stress_mpa: number;
 }
 
 export interface GeometryParams {

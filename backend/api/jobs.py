@@ -28,6 +28,7 @@ class JobOut(BaseModel):
     status: str
     geometry_params: Optional[dict]
     mesh_params: Optional[dict]
+    bc_params: Optional[dict]
     mesh_result: Optional[dict]
     analysis_result: Optional[dict]
     ai_report: Optional[str]
@@ -47,6 +48,7 @@ def _to_out(job: Job) -> dict:
         "status": job.status.value if job.status else None,
         "geometry_params": job.geometry_params,
         "mesh_params": job.mesh_params,
+        "bc_params": job.bc_params,
         "mesh_result": job.mesh_result,
         "analysis_result": job.analysis_result,
         "ai_report": job.ai_report,

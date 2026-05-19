@@ -1,46 +1,86 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 
-// Region color scheme matching Abaqus conventions
-// 0=Map/Hex (blue), 1=Junction Auto/Tet (orange), 2=Branch Auto/Tet (pink), 3=Branch Map (teal)
+// Region colors: 0=Map/Hex, 1=Junction, 2=Branch Auto, 3=Branch Map
 const REGION_COLORS = [0x3a86ff, 0xff6b35, 0xff006e, 0x2ec4b6];
 const REGION_LABELS = [
-  "Map/Hex (균일 메시)",       // 0 — Case 1 전체, Case 2 직관부
-  "Junction Auto/Tet",         // 1 — Case 2 접합부
-  "Branch Auto/Tet",           // 2 — Case 2 branch 자동
-  "Branch Map/Hex",            // 3 — Case 2 branch 직관
+  "Map/Hex (균일 메시)",
+  "Junction Auto/Tet",
+  "Branch Auto/Tet",
+  "Branch Map/Hex",
 ];
 
+// VTK cell types that are already surface elements (no face extraction needed)
+const SURFACE_TYPES = new Set([5, 9]); // Triangle(5), Quad(9)
+
+// Face connectivity tables — local vertex indices per element type
+// Ordering is consistent but direction doesn't matter (DoubleSide material)
+const TET4_FACES: number[][] = [
+  [0, 1, 2], [0, 1, 3], [1, 2, 3], [0, 3, 2],
+];
+const HEX8_FACES: number[][] = [
+  [0, 3, 2, 1], [4, 5, 6, 7],
+  [0, 1, 5, 4], [1, 2, 6, 5],
+  [2, 3, 7, 6], [3, 0, 4, 7],
+];
+const WEDGE6_FACES: number[][] = [
+  [0, 2, 1], [3, 4, 5],
+  [0, 1, 4, 3], [1, 2, 5, 4], [0, 3, 5, 2],
+];
+
+function cellFaces(cellType: number, verts: number[]): number[][] {
+  const pick = (table: number[][]) => table.map((f) => f.map((i) => verts[i]));
+  switch (cellType) {
+    case 5:  return [verts];          // Tri
+    case 9:  return [verts];          // Quad
+    case 10: return pick(TET4_FACES); // Tet4 (C3D4)
+    case 24: return pick(TET4_FACES); // Tet10 — corner nodes 0-3 only
+    case 12: return pick(HEX8_FACES); // Hex8 (C3D8/C3D8R)
+    case 25: return pick(HEX8_FACES); // Hex20 — corner nodes 0-7 only
+    case 13: return pick(WEDGE6_FACES);// Wedge6 (C3D6)
+    default: return [verts];
+  }
+}
+
+// Jet colormap: blue → cyan → green → yellow → red
+function jetColor(t: number): [number, number, number] {
+  t = Math.max(0, Math.min(1, t));
+  return [
+    Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3))),
+    Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2))),
+    Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1))),
+  ];
+}
+
 interface VtkData {
-  positions: Float32Array;
-  indices: Uint32Array;       // triangle indices (expanded, non-indexed for per-face color)
-  edgePositions: Float32Array; // line segment endpoints (2 × 3 floats per edge)
+  triPositions: Float32Array;
+  triColors: Float32Array;
+  edgePositions: Float32Array;
   regionCounts: number[];
   totalCells: number;
-  // per-triangle color (3 vertices × 3 RGB)
-  colors: Float32Array;
+  isVolume: boolean;
+  misesRange: [number, number] | null;
 }
 
 function parseVtk(text: string): VtkData | null {
   try {
     const lines = text.split("\n");
     let i = 0;
-    const find = (kw: string) => {
+    const advance = (kw: string) => {
       while (i < lines.length && !lines[i].toUpperCase().startsWith(kw.toUpperCase())) i++;
     };
 
     // POINTS
-    find("POINTS");
+    advance("POINTS");
     const nPts = parseInt(lines[i++].split(/\s+/)[1]);
-    const positions = new Float32Array(nPts * 3);
+    const pts = new Float32Array(nPts * 3);
     let pi = 0;
     while (pi < nPts * 3) {
-      const vals = lines[i++].trim().split(/\s+/).map(Number);
-      for (const v of vals) positions[pi++] = v;
+      for (const v of lines[i++].trim().split(/\s+/).map(Number)) pts[pi++] = v;
     }
 
     // CELLS
-    find("CELLS");
+    advance("CELLS");
     const nCells = parseInt(lines[i++].split(/\s+/)[1]);
     const rawCells: number[][] = [];
     for (let c = 0; c < nCells; c++) {
@@ -48,77 +88,122 @@ function parseVtk(text: string): VtkData | null {
       rawCells.push(vals.slice(1));
     }
 
-    // CELL_TYPES (skip)
-    find("CELL_TYPES");
+    // CELL_TYPES (previously skipped — now parsed)
+    advance("CELL_TYPES");
     i++;
-    for (let c = 0; c < nCells; c++) i++;
+    const cellTypes: number[] = [];
+    for (let c = 0; c < nCells; c++) cellTypes.push(parseInt(lines[i++].trim()) || 9);
+    const postTypesLine = i;
 
-    // CELL_DATA SCALARS region
-    const cellRegions: number[] = new Array(nCells).fill(0);
-    const regionIdx = lines.findIndex((l, idx) => idx >= i && l.trim() === "SCALARS region int 1");
-    if (regionIdx !== -1) {
-      let ri = regionIdx + 2;
+    const isVolume = cellTypes.some((t) => !SURFACE_TYPES.has(t));
+
+    // SCALARS: region int (mock) or mises float (real Abaqus)
+    const cellRegions = new Int32Array(nCells);
+    const cellMises = new Float64Array(nCells);
+    let hasMises = false;
+
+    const rIdx = lines.findIndex(
+      (l, idx) => idx >= postTypesLine && /^SCALARS\s+region/i.test(l.trim())
+    );
+    if (rIdx !== -1) {
+      let ri = rIdx + 2; // skip LOOKUP_TABLE line
+      for (let c = 0; c < nCells; c++) cellRegions[c] = parseInt(lines[ri++]) || 0;
+    }
+
+    const mIdx = lines.findIndex(
+      (l, idx) => idx >= postTypesLine && /^SCALARS\s+mises/i.test(l.trim())
+    );
+    if (mIdx !== -1) {
+      hasMises = true;
+      let ri = mIdx + 2;
+      for (let c = 0; c < nCells; c++) cellMises[c] = parseFloat(lines[ri++]) || 0;
+    }
+
+    let misesMin = 0, misesMax = 0;
+    if (hasMises) {
+      misesMin = Infinity; misesMax = -Infinity;
       for (let c = 0; c < nCells; c++) {
-        cellRegions[c] = parseInt(lines[ri++]) || 0;
+        if (cellMises[c] < misesMin) misesMin = cellMises[c];
+        if (cellMises[c] > misesMax) misesMax = cellMises[c];
       }
     }
 
-    // ── Build triangle geometry (expanded, non-indexed for per-face color) ────
-    const triPos: number[]   = [];
-    const triColors: number[] = [];
-    // ── Build edge geometry directly from quad/tri connectivity ──────────────
-    // Key insight: draw cell edges explicitly, angle-independent
-    // Use a Set to deduplicate shared edges
+    // Region counts (per cell, used for legend)
+    const regionCounts = [0, 0, 0, 0];
+    for (let c = 0; c < nCells; c++) regionCounts[Math.min(cellRegions[c], 3)]++;
+
+    // ── External face extraction ─────────────────────────────────────────────
+    // Each face is keyed by sorted vertex set.
+    // Volumetric: internal faces appear twice (count=2) → filter out.
+    // Surface: each cell is its own face (count=1 always).
+    const faceMap = new Map<string, {
+      verts: number[]; count: number; region: number; mises: number;
+    }>();
+
+    for (let c = 0; c < nCells; c++) {
+      const faces = cellFaces(cellTypes[c], rawCells[c]);
+      const region = Math.min(cellRegions[c], 3);
+      const mises = cellMises[c];
+      for (const face of faces) {
+        const key = [...face].sort((a, b) => a - b).join(",");
+        const e = faceMap.get(key);
+        if (e) { e.count++; }
+        else   { faceMap.set(key, { verts: face, count: 1, region, mises }); }
+      }
+    }
+
+    // ── Triangulate external faces + collect wireframe edges ─────────────────
+    const triPos: number[] = [];
+    const triCol: number[] = [];
     const edgeSet = new Set<string>();
     const edgePos: number[] = [];
 
-    const regionCounts = [0, 0, 0, 0];
+    for (const { verts, count, region, mises } of faceMap.values()) {
+      // Skip internal faces for volumetric meshes
+      if (isVolume && count !== 1) continue;
 
-    for (let c = 0; c < nCells; c++) {
-      const cell = rawCells[c];
-      const region = Math.min(cellRegions[c] ?? 0, 3);
-      regionCounts[region]++;
+      // Color: jet colormap for mises, region palette for mock
+      let r: number, g: number, b: number;
+      if (hasMises) {
+        const t = misesMax > misesMin ? (mises - misesMin) / (misesMax - misesMin) : 0.5;
+        [r, g, b] = jetColor(t);
+      } else {
+        const hex = REGION_COLORS[region];
+        r = ((hex >> 16) & 0xff) / 255;
+        g = ((hex >> 8)  & 0xff) / 255;
+        b = (hex & 0xff) / 255;
+      }
 
-      const hex = REGION_COLORS[region];
-      const r = ((hex >> 16) & 0xff) / 255;
-      const g = ((hex >> 8)  & 0xff) / 255;
-      const b = (hex & 0xff) / 255;
-
-      // Triangulate
-      const tris: [number, number, number][] = cell.length === 4
-        ? [[cell[0], cell[1], cell[2]], [cell[0], cell[2], cell[3]]]
-        : [[cell[0], cell[1], cell[2]]];
-
-      for (const [a, b2, c2] of tris) {
-        for (const vi of [a, b2, c2]) {
-          triPos.push(positions[vi*3], positions[vi*3+1], positions[vi*3+2]);
-          triColors.push(r, g, b);
+      // Fan triangulation (works for tri and quad faces)
+      for (let t = 1; t < verts.length - 1; t++) {
+        for (const vi of [verts[0], verts[t], verts[t + 1]]) {
+          triPos.push(pts[vi * 3], pts[vi * 3 + 1], pts[vi * 3 + 2]);
+          triCol.push(r, g, b);
         }
       }
 
-      // Edges: for quad [0,1,2,3] → edges (0,1),(1,2),(2,3),(3,0)
-      const n = cell.length;
-      for (let e = 0; e < n; e++) {
-        const va = cell[e];
-        const vb = cell[(e + 1) % n];
-        const key = va < vb ? `${va},${vb}` : `${vb},${va}`;
-        if (!edgeSet.has(key)) {
-          edgeSet.add(key);
+      // Edges of this face (deduplicated globally)
+      for (let e = 0; e < verts.length; e++) {
+        const va = verts[e], vb = verts[(e + 1) % verts.length];
+        const ek = va < vb ? `${va},${vb}` : `${vb},${va}`;
+        if (!edgeSet.has(ek)) {
+          edgeSet.add(ek);
           edgePos.push(
-            positions[va*3], positions[va*3+1], positions[va*3+2],
-            positions[vb*3], positions[vb*3+1], positions[vb*3+2],
+            pts[va * 3], pts[va * 3 + 1], pts[va * 3 + 2],
+            pts[vb * 3], pts[vb * 3 + 1], pts[vb * 3 + 2],
           );
         }
       }
     }
 
     return {
-      positions: new Float32Array(triPos),
-      indices: new Uint32Array(0),       // unused — geometry is already expanded
+      triPositions: new Float32Array(triPos),
+      triColors: new Float32Array(triCol),
       edgePositions: new Float32Array(edgePos),
-      colors: new Float32Array(triColors),
       regionCounts,
       totalCells: nCells,
+      isVolume,
+      misesRange: hasMises ? [misesMin, misesMax] : null,
     };
   } catch {
     return null;
@@ -131,8 +216,21 @@ interface Props {
 
 export default function MeshViewer({ vtkUrl }: Props) {
   const mountRef  = useRef<HTMLDivElement>(null);
-  const [stats, setStats] = useState<{ totalCells: number; regionCounts: number[] } | null>(null);
+  const wireRef   = useRef<THREE.LineSegments | null>(null);
+  const showWireRef = useRef(true);
+  const [stats, setStats] = useState<{
+    totalCells: number;
+    regionCounts: number[];
+    isVolume: boolean;
+    misesRange: [number, number] | null;
+  } | null>(null);
   const [showWire, setShowWire] = useState(true);
+
+  // Wireframe toggle: update directly without re-parsing VTK
+  useEffect(() => {
+    showWireRef.current = showWire;
+    if (wireRef.current) wireRef.current.visible = showWire;
+  }, [showWire]);
 
   useEffect(() => {
     const el = mountRef.current;
@@ -166,38 +264,39 @@ export default function MeshViewer({ vtkUrl }: Props) {
         const data = parseVtk(text);
         if (!data) return;
 
-        setStats({ totalCells: data.totalCells, regionCounts: data.regionCounts });
+        setStats({
+          totalCells: data.totalCells,
+          regionCounts: data.regionCounts,
+          isVolume: data.isVolume,
+          misesRange: data.misesRange,
+        });
 
-        // ── Surface mesh (triangles with per-vertex region color) ──────────
+        // Surface mesh
         const geo = new THREE.BufferGeometry();
-        geo.setAttribute("position", new THREE.BufferAttribute(data.positions, 3));
-        geo.setAttribute("color",    new THREE.BufferAttribute(data.colors, 3));
+        geo.setAttribute("position", new THREE.BufferAttribute(data.triPositions, 3));
+        geo.setAttribute("color",    new THREE.BufferAttribute(data.triColors, 3));
         geo.computeVertexNormals();
-
-        const meshMat = new THREE.MeshPhongMaterial({
+        group.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
           vertexColors: true,
           side: THREE.DoubleSide,
           transparent: true,
           opacity: 0.82,
           shininess: 15,
-        });
-        group.add(new THREE.Mesh(geo, meshMat));
+        })));
 
-        // ── Wireframe: edges extracted directly from cell connectivity ─────
-        // Uses edgePositions built in parseVtk — angle-independent, shows every element boundary
+        // Wireframe (edges from external faces only)
         const wireGeo = new THREE.BufferGeometry();
         wireGeo.setAttribute("position", new THREE.BufferAttribute(data.edgePositions, 3));
-        const wireMat = new THREE.LineBasicMaterial({
+        const wire = new THREE.LineSegments(wireGeo, new THREE.LineBasicMaterial({
           color: 0x0a0a0a,
           transparent: true,
           opacity: 0.5,
-        });
-        const wire = new THREE.LineSegments(wireGeo, wireMat);
-        wire.visible = showWire;
-        wire.name = "wireframe";
+        }));
+        wire.visible = showWireRef.current;
+        wireRef.current = wire;
         group.add(wire);
 
-        // Auto-center + fit camera
+        // Fit camera to mesh
         const box    = new THREE.Box3().setFromObject(group);
         const center = box.getCenter(new THREE.Vector3());
         const size   = box.getSize(new THREE.Vector3()).length();
@@ -246,6 +345,7 @@ export default function MeshViewer({ vtkUrl }: Props) {
 
     return () => {
       cancelAnimationFrame(animId);
+      wireRef.current = null;
       el.removeEventListener("mousedown", onDown);
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("mousemove", onMove);
@@ -254,14 +354,6 @@ export default function MeshViewer({ vtkUrl }: Props) {
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
     };
   }, [vtkUrl]);
-
-  // Sync wireframe toggle without re-mounting renderer
-  useEffect(() => {
-    if (!mountRef.current) return;
-    const canvas = mountRef.current.querySelector("canvas");
-    if (!canvas) return;
-    // Access Three.js scene via renderer — simpler: just remount (small cost since mesh is small)
-  }, [showWire]);
 
   if (!vtkUrl) {
     return (
@@ -275,29 +367,56 @@ export default function MeshViewer({ vtkUrl }: Props) {
     <div className="relative w-full h-full">
       <div ref={mountRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
 
-      {/* Legend */}
       {stats && (
-        <div className="absolute bottom-2 left-2 bg-gray-900/80 rounded-lg p-2 text-xs space-y-1">
-          {REGION_COLORS.map((hex, i) => {
-            const count = stats.regionCounts[i];
-            if (count === 0) return null;
-            return (
-              <div key={i} className="flex items-center gap-2">
-                <div className="w-3 h-3 rounded-sm flex-shrink-0"
-                     style={{ backgroundColor: `#${hex.toString(16).padStart(6, "0")}` }} />
-                <span className="text-gray-300">
-                  {REGION_LABELS[i]} <span className="text-gray-500">({count.toLocaleString()})</span>
+        <div className="absolute bottom-2 left-2 bg-gray-900/80 rounded-lg p-2 text-xs space-y-1 max-w-52">
+          {/* Region legend — mock VTK (no mises) */}
+          {!stats.misesRange &&
+            REGION_COLORS.map((hex, i) => {
+              const count = stats.regionCounts[i];
+              if (count === 0) return null;
+              return (
+                <div key={i} className="flex items-center gap-2">
+                  <div
+                    className="w-3 h-3 rounded-sm flex-shrink-0"
+                    style={{ backgroundColor: `#${hex.toString(16).padStart(6, "0")}` }}
+                  />
+                  <span className="text-gray-300">
+                    {REGION_LABELS[i]}{" "}
+                    <span className="text-gray-500">({count.toLocaleString()})</span>
+                  </span>
+                </div>
+              );
+            })}
+
+          {/* Mises colorbar — real Abaqus VTK */}
+          {stats.misesRange && (
+            <>
+              <div className="text-gray-400 font-medium">Von Mises (MPa)</div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-blue-400 tabular-nums">
+                  {stats.misesRange[0].toFixed(1)}
+                </span>
+                <div
+                  className="flex-1 h-2.5 rounded"
+                  style={{
+                    background:
+                      "linear-gradient(to right,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000)",
+                  }}
+                />
+                <span className="text-red-400 tabular-nums">
+                  {stats.misesRange[1].toFixed(1)}
                 </span>
               </div>
-            );
-          })}
+            </>
+          )}
+
           <div className="text-gray-500 pt-0.5 border-t border-gray-700">
-            총 {stats.totalCells.toLocaleString()} 요소 (surface)
+            {stats.totalCells.toLocaleString()} 요소
+            {" "}({stats.isVolume ? "volumetric" : "surface"})
           </div>
         </div>
       )}
 
-      {/* Wireframe toggle */}
       <button
         onClick={() => setShowWire((v) => !v)}
         className={`absolute top-2 right-2 text-xs px-2 py-1 rounded transition ${

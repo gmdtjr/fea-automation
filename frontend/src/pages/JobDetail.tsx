@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import axios from "axios";
-import type { Job } from "../types/job";
+import type { Job, BcParams } from "../types/job";
 import { useJob } from "../hooks/useJob";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ export default function JobDetail() {
 // ── Action bar ────────────────────────────────────────────────────────────────
 
 function ActionBar({ job, onSetCase, onStartSolve, jobId, navigate }: {
-  job: { status: string; case_type: string | null; bc_params?: Record<string, unknown> | null };
+  job: { status: string; case_type: string | null; bc_params: BcParams | null };
   onSetCase: (t: string) => void;
   onStartSolve: () => void;
   jobId: string;
@@ -177,7 +177,7 @@ function ActionBar({ job, onSetCase, onStartSolve, jobId, navigate }: {
     return (
       <BcSettingsPanel
         jobId={jobId}
-        existingBcParams={job.bc_params ?? null}
+        existingBcParams={job.bc_params}
         onStartSolve={onStartSolve}
       />
     );
@@ -199,14 +199,14 @@ function ActionBar({ job, onSetCase, onStartSolve, jobId, navigate }: {
 // ── BC Settings Panel ─────────────────────────────────────────────────────────
 
 const MATERIALS = [
-  { id: "STEEL_A106_GrB",  label: "Carbon Steel A106 Gr.B",  E: 200000, nu: 0.3, density: 7.85e-9, allowable: 138 },
-  { id: "STEEL_A312_TP316", label: "Stainless 316L (A312)",   E: 195000, nu: 0.3, density: 7.99e-9, allowable: 115 },
-  { id: "CUSTOM",           label: "사용자 입력",              E: 200000, nu: 0.3, density: 7.85e-9, allowable: 138 },
+  { id: "STEEL_A106_GrB",   label: "Carbon Steel A106 Gr.B", E: 200000, nu: 0.3, density: 7.85e-9, allowable: 138 },
+  { id: "STEEL_A312_TP316", label: "Stainless 316L (A312)",  E: 195000, nu: 0.3, density: 7.99e-9, allowable: 115 },
+  { id: "CUSTOM",           label: "사용자 입력",             E: 200000, nu: 0.3, density: 7.85e-9, allowable: 138 },
 ];
 
 function BcSettingsPanel({ jobId, existingBcParams, onStartSolve }: {
   jobId: string;
-  existingBcParams: Record<string, unknown> | null;
+  existingBcParams: BcParams | null;
   onStartSolve: () => void;
 }) {
   const [matId,     setMatId]     = useState(MATERIALS[0].id);
@@ -216,20 +216,21 @@ function BcSettingsPanel({ jobId, existingBcParams, onStartSolve }: {
   const [nu,        setNu]        = useState(0.3);
   const [fixedEnd,  setFixedEnd]  = useState<"inlet" | "outlet" | "both">("inlet");
   const [saving,    setSaving]    = useState(false);
-  const [saved,     setSaved]     = useState(false);
 
-  // Pre-fill from existing bc_params if present
-  useState(() => {
+  // Pre-fill from saved bc_params when available (fires once bc_params arrives from API)
+  useEffect(() => {
     if (!existingBcParams) return;
-    const mat = existingBcParams.material as Record<string, number> | undefined;
+    const mat = existingBcParams.material;
     if (mat) {
+      const matchedMat = MATERIALS.find(m => m.id === mat.name);
+      setMatId(matchedMat ? mat.name : "CUSTOM");
       setAllowable(mat.allowable_stress ?? 138);
       setE(mat.youngs_modulus ?? 200000);
       setNu(mat.poissons_ratio ?? 0.3);
     }
-    if (existingBcParams.pressure_mpa) setPressure(existingBcParams.pressure_mpa as number);
-    if (existingBcParams.fixed_faces)  setFixedEnd(existingBcParams.fixed_faces as "inlet");
-  });
+    setPressure(existingBcParams.pressure_mpa ?? 10.0);
+    setFixedEnd(existingBcParams.fixed_faces ?? "inlet");
+  }, [existingBcParams]);
 
   function onMatChange(id: string) {
     setMatId(id);
@@ -243,28 +244,33 @@ function BcSettingsPanel({ jobId, existingBcParams, onStartSolve }: {
 
   async function handleSaveAndSolve() {
     setSaving(true);
-    const mat = MATERIALS.find(m => m.id === matId) ?? MATERIALS[0];
-    const bc = {
-      material: {
-        name: matId,
-        youngs_modulus: E,
-        poissons_ratio: nu,
-        density: mat.density,
-        allowable_stress: allowable,
-      },
-      pressure_mpa: pressure,
-      fixed_faces: fixedEnd,
-      allowable_stress_mpa: allowable,
-    };
-    await axios.post(`/api/jobs/${jobId}/bc-params`, bc);
-    setSaved(true);
-    setSaving(false);
-    onStartSolve();
+    try {
+      const mat = MATERIALS.find(m => m.id === matId) ?? MATERIALS[0];
+      const bc: BcParams = {
+        material: {
+          name: matId,
+          youngs_modulus: E,
+          poissons_ratio: nu,
+          density: mat.density,
+          allowable_stress: allowable,
+        },
+        pressure_mpa: pressure,
+        fixed_faces: fixedEnd,
+        allowable_stress_mpa: allowable,
+      };
+      await axios.post(`/api/jobs/${jobId}/bc-params`, bc);
+      onStartSolve();
+    } finally {
+      setSaving(false);
+    }
   }
+
+  const isCustom = matId === "CUSTOM";
 
   return (
     <div className="bg-orange-900/20 border border-orange-700 rounded-xl p-5 mb-6">
       <h3 className="font-semibold text-sm mb-4">경계조건 / 하중 설정</h3>
+
       <div className="grid grid-cols-2 gap-4 mb-4">
         {/* Material */}
         <div className="col-span-2">
@@ -277,42 +283,63 @@ function BcSettingsPanel({ jobId, existingBcParams, onStartSolve }: {
             {MATERIALS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
           </select>
         </div>
+
         {/* Pressure */}
         <div>
           <label className="text-xs text-gray-400 block mb-1">내압 (MPa)</label>
-          <input type="number" value={pressure} step={0.5} min={0}
-            onChange={e => setPressure(parseFloat(e.target.value))}
-            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono" />
+          <input
+            type="number" value={pressure} step={0.5} min={0}
+            onChange={e => setPressure(parseFloat(e.target.value) || 0)}
+            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono"
+          />
         </div>
+
         {/* Allowable stress */}
         <div>
-          <label className="text-xs text-gray-400 block mb-1">허용 응력 (MPa)</label>
-          <input type="number" value={allowable} step={1} min={0}
-            onChange={e => setAllowable(parseFloat(e.target.value))}
-            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono" />
+          <label className="text-xs text-gray-400 block mb-1">
+            허용 응력 (MPa)
+            {!isCustom && <span className="text-gray-600 ml-1">— ASME B31.3</span>}
+          </label>
+          <input
+            type="number" value={allowable} step={1} min={0}
+            onChange={e => setAllowable(parseFloat(e.target.value) || 0)}
+            disabled={!isCustom}
+            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono disabled:opacity-50"
+          />
         </div>
-        {/* Young's modulus */}
+
+        {/* Young's modulus — only editable for CUSTOM */}
         <div>
           <label className="text-xs text-gray-400 block mb-1">탄성계수 E (MPa)</label>
-          <input type="number" value={E} step={1000} min={0}
-            onChange={e => setE(parseFloat(e.target.value))}
-            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono" />
+          <input
+            type="number" value={E} step={1000} min={0}
+            onChange={e => setE(parseFloat(e.target.value) || 0)}
+            disabled={!isCustom}
+            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono disabled:opacity-50"
+          />
         </div>
+
         {/* Poisson */}
         <div>
           <label className="text-xs text-gray-400 block mb-1">포아송비 ν</label>
-          <input type="number" value={nu} step={0.01} min={0} max={0.5}
-            onChange={e => setNu(parseFloat(e.target.value))}
-            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono" />
+          <input
+            type="number" value={nu} step={0.01} min={0} max={0.5}
+            onChange={e => setNu(parseFloat(e.target.value) || 0)}
+            disabled={!isCustom}
+            className="w-full bg-gray-800 rounded px-3 py-1.5 text-sm font-mono disabled:opacity-50"
+          />
         </div>
+
         {/* Fixed end */}
         <div className="col-span-2">
           <label className="text-xs text-gray-400 block mb-1">고정단 (Encastre)</label>
-          <div className="flex gap-3">
+          <div className="flex gap-4">
             {(["inlet", "outlet", "both"] as const).map(v => (
               <label key={v} className="flex items-center gap-1.5 text-sm cursor-pointer">
-                <input type="radio" name="fixedEnd" value={v} checked={fixedEnd === v}
-                  onChange={() => setFixedEnd(v)} className="accent-orange-500" />
+                <input
+                  type="radio" name="fixedEnd" value={v} checked={fixedEnd === v}
+                  onChange={() => setFixedEnd(v)} className="accent-orange-500"
+                />
                 {v === "inlet" ? "입구만" : v === "outlet" ? "출구만" : "양쪽"}
               </label>
             ))}
@@ -322,14 +349,16 @@ function BcSettingsPanel({ jobId, existingBcParams, onStartSolve }: {
 
       <div className="flex items-center justify-between pt-3 border-t border-orange-800/50">
         <p className="text-xs text-gray-500">
-          Phase 2(실제 Abaqus) 전까지는 공학식 기반 Mock 결과가 사용됩니다.
+          {existingBcParams
+            ? "저장된 설정이 있습니다. 변경 후 재실행 가능합니다."
+            : "ABAQUS_MODE=mock: 공학식 기반 결과가 사용됩니다."}
         </p>
         <button
           onClick={handleSaveAndSolve}
           disabled={saving}
           className="bg-orange-600 hover:bg-orange-500 px-5 py-2 rounded-lg text-sm font-medium transition disabled:opacity-50"
         >
-          {saving ? "저장 중..." : "저장 후 해석 시작"}
+          {saving ? "저장 중..." : existingBcParams ? "재해석 시작" : "저장 후 해석 시작"}
         </button>
       </div>
     </div>
